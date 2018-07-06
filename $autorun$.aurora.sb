@@ -1,0 +1,808 @@
+//-------------------------------------------------------------------------------------------------
+//
+//  DIRECTIVES
+//
+//-------------------------------------------------------------------------------------------------
+
+#DEFINE SOFTWARE_VERSION "1.0"
+#DEFINE BUILD_DATE       "20180706"
+#DEFINE AUTHOR           "Tarrin R"
+
+#DEFINE APP_EUI "APP EUI"                 // Application EUI from LoraWAN
+#DEFINE DEV_EUI "DEV EUI"                 // Device EUI from LoraWAN
+#DEFINE APP_KEY "APP KEY" // Application key from LoraWAN
+
+// Transmit every 10 seconds, TX_RATE: 0x0A, TX_CHECKSUM: 0x05, 0x1C (debugging)
+// Transmit every 15 seconds, TX_RATE: 0x0F, TX_CHECKSUM: 0x0A, 0x21
+// Transmit every 30 seconds, TX_RATE: 0x1E, TX_CHECKSUM: 0x19, 0x30
+// Transmit every 60 seconds, TX_RATE: 0x3C, TX_CHECKSUM: 0x37, 0x4E
+// Transmit every 2 minutes,  TX_RATE: 0x78, TX_CHECKSUM: 0x73, 0x8A
+// Transmit every 4 minutes,  TX_RATE: 0xF0, TX_CHECKSUM: 0xEB, 0x02
+
+#DEFINE LORAMAC_TX_RATE             0x1E       // Transmit interval
+#DEFINE LORAMAC_TX_CHECKSUM         0x19, 0x30 // GPS CFG-MSG packet checksum
+#DEFINE LORAMAC_JOIN_METHOD         1          // Used with LORAMACJoin, 1: Request, 0: Personalization
+#DEFINE LORAMAC_FPORT               1          // LORA TX port
+#DEFINE LORAMAC_PACKET_CONFIRMATION 0          // Request confirmation
+#DEFINE LORAMAC_PAYLOAD_LENGTH      14         // Payload length in bytes
+
+#DEFINE GPS_AIRBORNE_MODE 0 // GPS dynamic model
+
+#DEFINE I2C_CLOCK     400000 // I2C clock frequency in Hz
+#DEFINE I2C_SLAVEADDR 0x42   // Address of GPS
+#DEFINE I2C_REGADDR   0xFF   // Register address of data stream
+
+#DEFINE GPS_PACKET_LEN 19 // GPS packet array size
+
+#DEFINE msgId   1  // Proprietary message identifier: 00
+#DEFINE time    2  // UTC time [hhmmss.ss]
+#DEFINE lat     3  // Latitude [ddmm.mmmmm]
+#DEFINE NS      4  // North/South Indicator
+#DEFINE long    5  // Longitude [dddmm.mmmmm]
+#DEFINE EW      6  // East/West Indicator
+#DEFINE altRef  7  // Altitude above user datum ellipsoid [m]
+#DEFINE navStat 8  // Navigation Status
+#DEFINE hAcc    9  // Horizontal accuracy estimate [m]
+#DEFINE vAcc    10 // Vertical accuracy estimate [m]
+#DEFINE SOG     11 // Speed over ground [km/h]
+#DEFINE COG     12 // Course over ground [deg]
+#DEFINE vVel    13 // Vertical velocity (positive downwards) [m/s]
+#DEFINE diffAge 14 // Age of differential corrections [s]
+#DEFINE HDOP    15 // Horizontal Dilution of Precision
+#DEFINE VDOP    16 // Vertical Dilution of Precision
+#DEFINE TDOP    17 // Time Dilution of Precision
+#DEFINE numSvs  18 // Number of satellites used in the navigation solution
+
+#SET 7, 64 // Changes max simple local variables per routine
+
+
+//-------------------------------------------------------------------------------------------------
+//
+//  GLOBALS
+//
+//-------------------------------------------------------------------------------------------------
+
+DIM rc
+DIM error, gpserror
+DIM LORA_joined
+DIM I2C_opened, I2C_handle
+
+DIM payload$
+DIM GPS$[GPS_PACKET_LEN]
+
+DIM key[LORAMAC_PAYLOAD_LENGTH]
+key[0 ] = 0xDC
+key[1 ] = 0x7B
+key[2 ] = 0xB5
+key[3 ] = 0x3E
+key[4 ] = 0x9C
+key[5 ] = 0xCA
+key[6 ] = 0x0E
+key[7 ] = 0x75
+key[8 ] = 0x6F
+key[9 ] = 0x9B
+key[10] = 0xEA
+key[11] = 0xAC
+key[12] = 0x5E
+key[13] = 0x45
+
+
+//-------------------------------------------------------------------------------------------------
+//
+//  FUNCTIONS AND SUBS
+//
+//-------------------------------------------------------------------------------------------------
+
+//
+// SYSTEM INFO
+//
+FUNCTION SystemInfo() AS INTEGER
+
+  DIM pa$ : pa$ = SYSINFO$(14)
+
+  print "\n\n########################################"
+  print "\n AURORA ";SOFTWARE_VERSION
+  print "\n########################################"
+  print "\nBuild date              ";BUILD_DATE
+  print "\nAuthor                  ";AUTHOR
+  print "\nDevice ID               ";SYSINFO(0)
+  print "\nPublic address          ";STRHEXIZE$(pa$)
+  print "\nFirmware version        ";SYSINFO(3)
+  print "\nBASIC core version      ";SYSINFO(33)
+  print "\nFlash data total        ";SYSINFO(601)
+  print "\nFlash data free         ";SYSINFO(602)
+  print "\nFlash data deleted      ";SYSINFO(603)
+  print "\nFlash FAT total         ";SYSINFO(611)
+  print "\nFlash FAT free          ";SYSINFO(612)
+  print "\nFlash FAT deleted       ";SYSINFO(613)
+  print "\nNvRecord memory total   ";SYSINFO(631)
+  print "\nNvRecord memory free    ";SYSINFO(632)
+  print "\nNvRecord memory deleted ";SYSINFO(633)
+  print "\nConfig keys total       ";SYSINFO(641)
+  print "\nConfig keys free        ";SYSINFO(642)
+  print "\nConfig keys deleted     ";SYSINFO(643)
+  print "\n########################################\n"
+
+endfunc 1
+
+//
+// DELAY LOOP
+//
+SUB Delay(ms)
+
+  print "\nDelaying ";ms;"ms"
+
+  dim i : i = GetTickCount()
+
+  while GetTickSince(i) < ms
+  endwhile
+
+endsub
+
+//
+// I2C INITIALIZATION
+//
+FUNCTION I2CInit() AS INTEGER
+
+  print "\nInitializing I2C"
+
+  rc = I2COPEN(I2C_CLOCK, 0, I2C_handle)
+
+  if rc != 0 then
+    print "\nFailed to open I2C interface ";INTEGER.h'rc
+  else
+    print "\nI2C opened with handle ";I2C_handle
+    I2C_opened = 1
+  endif
+
+endfunc rc
+
+//
+// SET GPS MESSAGE RATE
+//
+FUNCTION GPSMessageConfig(class, id, rate, ck_a, ck_b) AS INTEGER
+
+  rc = I2CWRITEREG32(I2C_SLAVEADDR, 0xB5, 0x03010662)
+  rc = I2CWRITEREG8(I2C_SLAVEADDR, 0x00, class)
+  rc = I2CWRITEREG8(I2C_SLAVEADDR, id, rate)
+  rc = I2CWRITEREG8(I2C_SLAVEADDR, ck_a, ck_b)
+
+endfunc 1
+
+//
+// SET GPS Airborne
+//
+FUNCTION GPSAirborne() AS INTEGER
+
+  rc = I2CWRITEREG8(I2C_SLAVEADDR, 0xB5, 0x62)
+  rc = I2CWRITEREG32(I2C_SLAVEADDR, 0x06, 0x01002424)
+  rc = I2CWRITEREG32(I2C_SLAVEADDR, 0x00, 0x06)
+  rc = I2CWRITEREG32(I2C_SLAVEADDR, 0x00, 0x0)
+  rc = I2CWRITEREG32(I2C_SLAVEADDR, 0x00, 0x00)
+  rc = I2CWRITEREG32(I2C_SLAVEADDR, 0x00, 0x00)
+  rc = I2CWRITEREG32(I2C_SLAVEADDR, 0x00, 0x00)
+  rc = I2CWRITEREG32(I2C_SLAVEADDR, 0x00, 0x00)
+  rc = I2CWRITEREG32(I2C_SLAVEADDR, 0x00, 0x00)
+  rc = I2CWRITEREG8(I2C_SLAVEADDR, 0x55, 0xB4)
+
+endfunc 1
+
+//
+// GPS INITIALIZATION
+//
+FUNCTION GPSInit() AS INTEGER
+
+  print "\nInitializing GPS"
+
+  // Disable GGA
+  rc = GPSMessageConfig(0xF0, 0x00, 0x00, 0xFA, 0x0F)
+
+  // Disable GLL
+  rc = GPSMessageConfig(0xF0, 0x01, 0x00, 0xFB, 0x11)
+
+  // Disable GSA
+  rc = GPSMessageConfig(0xF0, 0x02, 0x00, 0xFC, 0x13)
+
+  // Disable GSV
+  rc = GPSMessageConfig(0xF0, 0x03, 0x00, 0xFD, 0x15)
+
+  // Disable RMC
+  rc = GPSMessageConfig(0xF0, 0x04, 0x00, 0xFE, 0x17)
+
+  // Disable RMC
+  rc = GPSMessageConfig(0xF0, 0x05, 0x00, 0xFF, 0x19)
+
+  // Enable PUBX Position
+  rc = GPSMessageConfig(0xF1, 0x00, LORAMAC_TX_RATE, LORAMAC_TX_CHECKSUM)
+
+  // Set dynamic model
+  if (GPS_AIRBORNE_MODE) then
+    rc = GPSAirborne()
+  endif
+
+endfunc 1
+
+//
+// DISPLAY GPS STREAM
+//
+FUNCTION GPSStream() AS INTEGER
+
+  dim in,s$
+
+  while 1
+    rc = I2CREADREG8(I2C_SLAVEADDR, I2C_REGADDR, in)
+    if in != 0xFF then
+      rc = STRSETCHR(s$, in, 0)
+      PRINT s$
+      PRINT "(0x";STRHEXIZE$(s$);")"
+    endif
+  endwhile
+
+endfunc 1
+
+//
+// GPS RESET
+//
+FUNCTION GPSReset() AS INTEGER
+
+  print "\nHard resetting GPS..."
+
+  rc = I2CWRITEREG16(I2C_SLAVEADDR, 0xB5, 0x04040662)
+  rc = I2CWRITEREG8(I2C_SLAVEADDR, 0x00, 0xFF)
+  rc = I2CWRITEREG16(I2C_SLAVEADDR, 0xFF, 0x0000)
+  rc = I2CWRITEREG8(I2C_SLAVEADDR, 0x0C, 0x5D)
+
+  Delay(500)
+
+endfunc 1
+
+//
+// GET GPS LOCATION
+//
+FUNCTION GetLocation() AS INTEGER
+
+  print "\nWaiting for location"
+
+  DIM i,j,r
+  DIM in : in = 0xFF
+
+  while in != 0x24 // '$'
+    rc = I2CREADREG8(I2C_SLAVEADDR, I2C_REGADDR, in)
+  endwhile
+
+  for i = 0 TO GPS_PACKET_LEN - 1
+    for j = 0 TO 50
+
+      rc = I2CREADREG8(I2C_SLAVEADDR, I2C_REGADDR, in)
+  
+      if rc != 0 then
+        print "Failed to read from GPS"
+      endif
+
+      if in != 0x2C then // ','
+        rc = STRSETCHR(GPS$[i], in, j)
+      else 
+        BREAK
+      endif
+
+    next
+  next
+
+endfunc !STRCMP(GPS$[0], "PUBX")
+
+//
+// PRINT GPS LOCATION
+//
+FUNCTION PrintLocation() AS INTEGER
+  print "\n\n----------------------------------------"
+  print "\n LOCATION INFORMATION"
+  print "\n----------------------------------------"
+  print "\nmsgId   ";GPS$[msgId  ]                  // Proprietary message identifier: 00
+  print "\ntime    ";GPS$[time   ];" [hhmmss.ss]"   // UTC time [hhmmss.ss]
+  print "\nlat     ";GPS$[lat    ];" [ddmm.mmmmm]"  // Latitude [ddmm.mmmmm]
+  print "\nNS      ";GPS$[NS     ]                  // North/South Indicator
+  print "\nlong    ";GPS$[long   ];" [dddmm.mmmmm]" // Longitude [dddmm.mmmmm]
+  print "\nEW      ";GPS$[EW     ]                  // East/West Indicator
+  print "\naltRef  ";GPS$[altRef ];" [m]"           // Altitude above user datum ellipsoid [m]
+  print "\nnavStat ";GPS$[navStat]                  // Navigation Status
+  print "\nhAcc    ";GPS$[hAcc   ];" [m]"           // Horizontal accuracy estimate [m]
+  print "\nvAcc    ";GPS$[vAcc   ];" [m]"           // Vertical accuracy estimate [m]
+  print "\nSOG     ";GPS$[SOG    ];" [km/h]"        // Speed over ground [km/h]
+  print "\nCOG     ";GPS$[COG    ];" [deg]"         // Course over ground [deg]
+  print "\nvVel    ";GPS$[vVel   ];" [m/s]"         // Vertical velocity (positive downwards) [m/s]
+  print "\ndiffAge ";GPS$[diffAge];" [s]"           // Age of differential corrections [s]
+  print "\nHDOP    ";GPS$[HDOP   ]                  // Horizontal Dilution of Precision
+  print "\nVDOP    ";GPS$[VDOP   ]                  // Vertical Dilution of Precision
+  print "\nTDOP    ";GPS$[TDOP   ]                  // Time Dilution of Precision
+  print "\nnumSvs  ";GPS$[numSvs ]                  // Number of satellites used in the navigation solution
+  print "\n----------------------------------------\n"
+
+endfunc 1
+
+//
+// LORA INITIALIZATION
+//
+FUNCTION LORAInit() AS INTEGER
+
+  print "\nInitializing LORAMAC"
+
+  DIM temp$
+
+  print "\n\n########################################"
+  print "\n LoraWAN"
+  print "\n########################################"
+
+  // Set AppEui
+  temp$ = APP_EUI
+  rc = LORAMACSetOption(7, temp$)
+  rc = LORAMACGetOption(7, temp$)
+  print "\nAppEui       ";temp$
+
+  // Set DevEui
+  temp$ = DEV_EUI
+  rc = LORAMACSetOption(5, temp$)
+  rc = LORAMACGetOption(5, temp$)
+  print "\nDevEui       ";temp$
+
+  // Set AppKey
+  temp$ = APP_KEY
+  rc = LORAMACSetOption(8, temp$)
+
+  // Print device class
+  rc = LORAMACGetOption(26, temp$)
+  print "\nDevice class ";temp$ 
+
+  // Disable ADR
+  temp$ = "0"
+  rc = LORAMACSetOption(17, temp$)
+  rc = LORAMACGetOption(17, temp$)
+  print "ADR          ";temp$
+
+  // Set data rate
+  temp$ = "1"
+  rc = LORAMACSetOption(2, temp$)
+  rc = LORAMACGetOption(2, temp$)
+  print "Data rate    ";temp$
+
+  // Set TX power
+  temp$ = "30"
+  rc = LORAMACSetOption(1, temp$)
+  rc = LORAMACGetOption(1, temp$)
+  print "\nTX power     ";temp$
+
+  // Print voltage
+  rc = LORAMACGetOption(14, temp$)
+  print "\nVoltage      ";temp$
+
+  // Set subband
+  temp$ = "2"
+  rc = LORAMACSetOption(28, temp$)
+  rc = LORAMACGetOption(28, temp$)
+  print "\nSubband\n";temp$
+
+  print "########################################\n"
+
+endfunc 1
+
+//
+// FORM LORA PAYLOAD
+//
+FUNCTION FormPayload() AS INTEGER
+
+  DIM hour, minute, second
+  DIM latdeg, latmin, latdec
+  DIM longdeg, longmin, longdec
+  DIM ns, ew
+  DIM alt, sog, vvel, hacc, vacc, sat, ud
+  DIM temp$
+
+  payload$ = ""
+
+  temp$  = STRSPLITLEFT$(GPS$[time], 2)
+  hour   = ABS(STRVALDEC(temp$))
+  temp$  = STRSPLITLEFT$(GPS$[time], 2)
+  minute = ABS(STRVALDEC(temp$))
+  temp$  = STRSPLITLEFT$(GPS$[time], 2)
+  second = ABS(STRVALDEC(temp$))
+
+  if ((hour > 24) | (minute > 60) | (second > 60)) then
+    print "\nOVERFLOW: time"
+    hour   = 24
+    minute = 60
+    second = 60
+  endif
+
+  temp$  = STRSPLITLEFT$(GPS$[lat], 2)
+  latdeg = ABS(STRVALDEC(temp$))
+  temp$  = STRSPLITLEFT$(GPS$[lat], 3)
+  latmin = ABS(STRVALDEC(temp$))
+  temp$  = STRSPLITLEFT$(GPS$[lat], 3)
+  latdec = ABS(STRVALDEC(temp$))
+
+  if ((latdeg > 90) | (latmin > 60) | (latdec > 999)) then
+    print "\nOVERFLOW: lat"
+    latdeg = 90
+    latmin = 60
+    latdec = 999
+  endif
+
+  temp$  = STRSPLITLEFT$(GPS$[long], 3)
+  longdeg = ABS(STRVALDEC(temp$))
+  temp$  = STRSPLITLEFT$(GPS$[long], 3)
+  longmin = ABS(STRVALDEC(temp$))
+  temp$  = STRSPLITLEFT$(GPS$[long], 3)
+  longdec = ABS(STRVALDEC(temp$))
+
+  if ((longdeg > 180) | (longmin > 60) | (longdec > 999)) then
+    print "\nOVERFLOW: long"
+    longdeg = 180
+    longmin = 60
+    longdec = 999
+  endif
+
+  temp$ = "S"
+  ns    = ABS(STRCMP(temp$, GPS$[NS]))
+  temp$ = "W"
+  ew    = ABS(STRCMP(temp$, GPS$[EW]))
+
+  if ((ns > 1) | (ew > 1)) then
+    print "\nOVERFLOW: ind"
+    ns = 1
+    ew = 1
+  endif
+
+  alt  = STRVALDEC(GPS$[altRef]) + 500
+  sog  = ABS(STRVALDEC(GPS$[SOG]))
+  vvel = STRVALDEC(GPS$[vVel])
+  hacc = ABS(STRVALDEC(GPS$[hAcc]))
+  vacc = ABS(STRVALDEC(GPS$[vAcc]))
+  sat  = ABS(STRVALDEC(GPS$[numSvs]))
+
+  if ((hacc > 63) | (vacc > 63)) then
+    print "\nOVERFLOW: acc"
+    hacc = 63
+    vacc = 63
+  endif
+
+  if(sog >= 255) then
+    print "\nOVERFLOW: sog"
+    sog = 255
+  endif
+
+  if(sat > 31) then
+    print "\nOVERFLOW: sat"
+    sat = 31
+  endif
+
+  if (vvel < 0) then
+    vvel = ABS(vvel)
+    ud = 0x01
+  else
+    ud = 0x00
+  endif
+
+  if (vvel > 15) then
+    print "\nOVERFLOW: vvel"
+    vvel = 15
+  endif
+
+  if ((alt < 0) | (alt > 65535)) then
+    print "\nOVERFLOW: alt"
+    alt = 35535
+  endif
+
+  rc = STRSETCHR(payload$, (hour << 3) | (minute >> 3), 0)
+  rc = STRSETCHR(payload$, ((minute & 0x07) << 5) | (second >> 1), 1)
+  rc = STRSETCHR(payload$, ((second & 0x01) << 7 | latdeg), 2)
+  rc = STRSETCHR(payload$, (latmin << 2) | (latdec >> 8), 3)
+  rc = STRSETCHR(payload$, (latdec & 0xFF), 4)
+  rc = STRSETCHR(payload$, (ns << 7) | (longdeg >> 1), 5)
+  rc = STRSETCHR(payload$, ((longdeg & 0x01) << 7) | (longmin << 1) | (longdec >> 9), 6)
+  rc = STRSETCHR(payload$, (longdec >> 1) & 0xFF, 7)
+  rc = STRSETCHR(payload$, ((longdec & 0x01) << 7) | (ew << 6) | (alt >> 10), 8)
+  rc = STRSETCHR(payload$, (alt >> 2) & 0xFF, 9)
+  rc = STRSETCHR(payload$, ((alt & 0x03) << 6) | (sog >> 2), 10)
+  rc = STRSETCHR(payload$, ((sog & 0x03) << 6) | (vvel << 2) | (ud << 1) | (hacc >> 5), 11)
+  rc = STRSETCHR(payload$, ((hacc & 0x1F) << 3) | (vacc >> 3), 12)
+  rc = STRSETCHR(payload$, ((vacc & 0x07) << 5) | sat, 13)
+
+endfunc 1
+
+//
+// ENCRYPT PAYLOAD
+//
+FUNCTION EncryptPayload() AS INTEGER
+
+  DIM i, temp
+
+  for i = 0 TO LORAMAC_PAYLOAD_LENGTH - 1
+    temp = STRXOR(payload$, i, 1, key[i])
+    rc = STRSETCHR(payload$, temp, i)
+  next
+  
+endfunc 1
+
+
+//-------------------------------------------------------------------------------------------------
+//
+//  EVENT HANDLERS
+//
+//-------------------------------------------------------------------------------------------------
+
+//
+// EVLORAMACJOINING
+//
+FUNCTION HandlerLoramacJoining() AS INTEGER
+  // Awaiting Join Response message or transitioning to Joined state
+  print "\nJoining LoraWAN"
+endfunc 1
+
+//
+// EVLORAMACJOINED
+//
+FUNCTION HandlerLoramacJoined() AS INTEGER
+  // JoinAccept has been received. You are now free to transmit data packets
+  print "\nJoined LoraWAN"
+  LORA_joined = 1
+endfunc 1
+
+//
+// EVLORAMACRXTIMEOUT
+//
+FUNCTION HandlerLoramacRxTimeout() AS INTEGER
+  // A JoinAccept has still not been received after the JoinRequest has been attempted a configured number of times
+  print "\nRX timeout"
+endfunc 1
+
+//
+// EVLORAMACTXTIMEOUT
+//
+FUNCTION HandlerLoramacTxTimeout() AS INTEGER
+  // Something has gone wrong so you need to resend the JoinRequest or data packet
+  print "\nTX timeout"
+endfunc 1
+
+//
+// EVLORAMACRXERROR
+//
+FUNCTION HandlerLoramacRxError() AS INTEGER
+  // Something has gone wrong so you need to resend the JoinRequest
+  print "\nRX error"
+endfunc 1
+
+//
+// EVLORAMACTXCOMPLETE
+//
+FUNCTION HandlerLoramacTxComplete() AS INTEGER
+  // TxComplete has been received
+  print "\nTX complete"
+endfunc 1
+
+//
+// EVLORAMACRXCOMPLETE
+//
+FUNCTION HandlerLoramacRxComplete() AS INTEGER
+  // RxComplete has been received
+  print "\nRX complete"
+endfunc 1
+
+//
+// EVLORAMACNEXTTX
+//
+FUNCTION HandlerNextTx() AS INTEGER
+  // Duty cycle available for transmit
+  print "\nNext TX"
+
+  if LORA_joined != 1 then
+    print "\nRejoining LoraWAN"
+    rc = LORAMACJoin(LORAMAC_JOIN_METHOD)
+
+  elseif I2C_opened != 1 then
+    print "\nReopening I2C"
+    rc = I2CInit()
+
+  else
+    Delay(LORAMAC_TX_RATE * 1000 - 5000)
+    rc = GetLocation()
+  
+    if (rc == 1) then
+      rc = PrintLocation()
+      rc = FormPayload()
+      rc = EncryptPayload()
+  
+      DIM currentsize, maxsize
+      DIM datarate$, newdatarate$ : newdatarate$ = "-1"
+      DIM subband$, actualsize : actualsize = LORAMAC_PAYLOAD_LENGTH
+      DIM i, temp$
+  
+      rc = LORAMACGetOption(2, datarate$)
+      rc = LORAMACGetOption(28, subband$)
+      
+      for i = 1 TO 4
+  
+        SPRINT #temp$, i
+        rc = LORAMACSetOption(2, temp$)
+        rc = LORAMACQueryTxPossible(LORAMAC_PAYLOAD_LENGTH, currentsize, maxsize)
+  
+        if (currentsize > LORAMAC_PAYLOAD_LENGTH) then
+          print "\nLoraWAN TX started"
+          newdatarate$ = temp$
+          rc = LORAMACSetOption(2, newdatarate$)
+          rc = LORAMACTxData(LORAMAC_FPORT, payload$, LORAMAC_PACKET_CONFIRMATION)
+          BREAK
+        endif
+      next
+    
+      if (rc != 0) | !STRCMP(newdatarate$, "-1") then
+  
+        print "\n# TX ERROR: Data payload too large"
+      
+      else
+  
+          print "\n\n----------------------------------------"
+          print "\n LORAMAC INFORMATION"
+          print "\n----------------------------------------"
+          print "\nOld data rate            ";datarate$
+          print "\nNew data rate            ";newdatarate$
+          print "\nMax payload size         ";maxsize
+          print "\nCurrent max payload size ";currentsize
+          print "\nActual payload size      ";actualsize
+          print "\n\nPayload\n";STRHEXIZE$(payload$)
+          print "\n\nSubband\n";subband$
+          print "----------------------------------------\n"
+  
+      endif
+  
+    else
+      print "\n# GPS ERROR: Invalid location data"
+      gpserror = gpserror + 1
+      print "\nNumber of GPS errors since reset: ";gpserror
+      if (gpserror > 5) then
+        rc = GPSReset()
+        print "\nRebooting..."
+        Delay(100)
+        RESET(0)
+      endif
+    endif
+  endif
+
+endfunc 1
+
+//
+// EVLORAMACSEQUENCECOMPLETE
+//
+FUNCTION HandlerSequenceComplete(flag, nexttime) AS INTEGER
+  // End of uplink/downlink sequence, now possible to load new uplink packet into the stack
+  // nexttime always 0 for US and AU modules 
+  print "\nSequence complete ";flag
+endfunc 1
+
+//
+// EVLORAMACRXDATA
+//
+FUNCTION HandlerLoramacRxData() AS INTEGER
+  // Downstream data received from gateway
+  print "\nRX complete"
+  dim rxdata$
+  dim RSSI,Port,SNR,FramePending,PacketType
+
+  rc = LORAMACRxData(rxdata$, RSSI, Port, SNR, FramePending, PacketType)
+
+  print "\nStatus ";Port;"\nRSSI: ";RSSI;" SNR: ";SNR;"\n"
+  print "\nData ";rxdata$
+endfunc 1
+
+//
+// EVLORAMACADR
+//
+FUNCTION HandlerLoramacAdrMessage(packettype, pending) AS INTEGER
+  // ADR packet received from gateway/server, parameters may have changed
+  print "\nADR packet received"
+  print "\nPacket type: ";packettype
+  print "\nPending: ";pending
+endfunc 1
+
+
+//-------------------------------------------------------------------------------------------------
+//
+//  ERROR HANDLERS
+//
+//-------------------------------------------------------------------------------------------------
+
+//
+// ONERROR
+//
+SUB HandlerOnError()
+  dim le
+  le = GetLastError()
+
+  print "\n# ERROR: ";le
+  error = error + 1
+  print "\nNumber of errors since reset: ";error
+
+  if error < 6 then
+    LORA_joined = 0
+    I2C_opened = 0
+    I2CCLOSE(I2C_handle)
+  else
+    rc = GPSReset()
+    print "\nRebooting..."
+    Delay(100)
+    RESET(0)
+  endif
+endsub
+
+//
+// ONFATALERROR
+//
+SUB HandlerOnFatalError()
+  dim le
+  le = GetLastError()
+
+  print "\n# FATAL ERROR: ";le
+  rc = GPSReset()
+  print "\nRebooting..."
+  Delay(100)
+  RESET(0)
+endsub
+
+
+//-------------------------------------------------------------------------------------------------
+//
+//  EVENT HANDLING
+//
+//-------------------------------------------------------------------------------------------------
+
+ONEVENT EVLORAMACJOINING CALL HandlerLoramacJoining
+ONEVENT EVLORAMACJOINED CALL HandlerLoramacJoined
+ONEVENT EVLORAMACRXTIMEOUT CALL HandlerLoramacRxTimeout
+ONEVENT EVLORAMACTXTIMEOUT CALL HandlerLoramacTxTimeout
+ONEVENT EVLORAMACRXERROR CALL HandlerLoramacRxError
+ONEVENT EVLORAMACTXCOMPLETE CALL HandlerLoramacTxComplete
+ONEVENT EVLORAMACRXCOMPLETE CALL HandlerLoramacRxComplete
+ONEVENT EVLORAMACRXDATA CALL HandlerLoramacRxData
+ONEVENT EVLORAMACNEXTTX CALL HandlerNextTx
+ONEVENT EVLORAMACSEQUENCECOMPLETE CALL HandlerSequenceComplete
+ONEVENT EVLORAMACADR CALL HandlerLoramacAdrMessage
+
+
+//-------------------------------------------------------------------------------------------------
+//
+//  ERROR HANDLING
+//
+//-------------------------------------------------------------------------------------------------
+
+ONERROR REDO HandlerOnError
+ONFATALERROR REDO HandlerOnFatalError
+
+
+//-------------------------------------------------------------------------------------------------
+//
+//  INITIALIZING
+//
+//-------------------------------------------------------------------------------------------------
+
+error       = 0
+gpserror    = 0
+LORA_joined = 0
+I2C_opened  = 0
+
+rc = SystemInfo()
+
+rc = I2CInit()
+
+rc = GPSInit()
+//rc = GPSStream()
+
+rc = LORAInit()
+
+rc = LORAMACJoin(LORAMAC_JOIN_METHOD)
+
+
+//-------------------------------------------------------------------------------------------------
+//
+//  WAITEVENT
+//
+//-------------------------------------------------------------------------------------------------
+
+WAITEVENT
