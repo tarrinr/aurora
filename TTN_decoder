@@ -1,0 +1,71 @@
+function Decoder(bytes, port) {
+  
+  // Return variable
+  var decoded;
+  
+  // Packet length
+  var length = 14;
+  
+  // Encryption key
+  var en = [ 0xdc, 0x7b, 0xb5, 0x3e, 0x9c, 0xca, 0x0e, 0x75, 0x6f, 0x9b, 0xea, 0xac, 0x5e, 0x45 ];
+  
+  // Check for valid length
+  if(bytes.length === length) {
+    
+    // Undo XOR encryption
+    for(var i = 0; i < length; i++) {
+      bytes[i] = bytes[i] ^ en[i];
+    }
+    
+    // Convert NS bit to char
+    var ns = bytes[5] >> 7;
+    if(ns === 1) { ns = 'N'}
+    else { ns = 'S' }
+  
+    // Convert EW bit to char
+    var ew = (bytes[8] >> 6) & 0x1;
+    if(ew === 1) { ew = 'E'}
+    else { ew = 'W' }
+    
+    // Convert UD bit to char
+    var ud = (bytes[11] >> 1) & 0x1;
+    if(ud === 1) { ud = 'U'}
+    else { ud = 'D' }
+  
+    // Decode payload
+    decoded = {
+      
+      // Time
+      HOUR:   bytes[0] >> 3,
+      MINUTE: ((bytes[0] & 0x07) << 3) | (bytes[1] >> 5),
+      SECOND: ((bytes[1] & 0x1F) << 1) | (bytes[2] >> 7),
+    
+      // Latitude
+      LATDEG: bytes[2] & 0x7F,
+      LATMIN: bytes[3] >> 2,
+      LATDEC: ((bytes[3] & 0x3) << 8) | bytes[4],
+      NS:     ns,
+      
+      // Longitude
+      LONGDEG: ((bytes[5] & 0x7F) << 1) | (bytes[6] >> 7),
+      LONGMIN: (bytes[6] & 0x7F) >> 1,
+      LONGDEC: ((bytes[6] & 0x1) << 9) | (bytes[7] << 1) | (bytes[8] >> 7),
+      EW:      ew,
+  
+      // Telemetry
+      ALT:  (((bytes[8] & 0x3F) << 10) | (bytes[9] << 2) | bytes[10] >> 6) - 500,
+      HVEL: ((bytes[10] & 0x3F) << 2) | (bytes[11] >> 6),
+      VVEL: ((bytes[11] & 0x3F) >> 2),
+      UD:   ud,
+      HACC: ((bytes[11] & 0x01) << 5) | (bytes[12] >> 3),
+      VACC: ((bytes[12] & 0x07) << 3) | (bytes[13] >> 5),
+      SAT:  bytes[13] & 0x1F
+    
+    };
+  }
+
+  // Packet not right length
+  else { decoded = { error: "Payload length not equal to " + length } }
+
+  return decoded;
+}
